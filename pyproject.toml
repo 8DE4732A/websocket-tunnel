@@ -20,9 +20,6 @@ build-backend = "hatchling.build"
 [tool.hatch.version]
 source = "vcs"
 
-[tool.hatch.build.hooks.vcs]
-version-file = "src/websocket_tunnel/_version.py"
-
 [tool.hatch.build.targets.wheel]
 packages = ["src/websocket_tunnel"]
 

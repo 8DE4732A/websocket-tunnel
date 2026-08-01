@@ -6,4 +6,3 @@ __pycache__/
 .coverage
 dist/
 build/
-src/websocket_tunnel/_version.py

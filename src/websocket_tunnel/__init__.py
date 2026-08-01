@@ -3,10 +3,7 @@
 from __future__ import annotations
 
 try:
-    from importlib.metadata import version, PackageNotFoundError
-    try:
-        __version__ = version("websocket-tunnel")
-    except PackageNotFoundError:
-        from ._version import __version__  # type: ignore[no-reattr]
+    from importlib.metadata import version
+    __version__: str = version("websocket-tunnel")
 except Exception:
     __version__ = "0.0.0"
