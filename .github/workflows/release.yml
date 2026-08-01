@@ -19,6 +19,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # hatch-vcs needs full history to derive version from git tags
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -29,17 +31,6 @@ jobs:
         uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
-
-      - name: Verify tag matches package version
-        if: startsWith(github.ref, 'refs/tags/')
-        run: |
-          tag="${GITHUB_REF_NAME#v}"
-          version="$(uv run python -c 'from websocket_tunnel import __version__; print(__version__)')"
-          if [ "$tag" != "$version" ]; then
-            echo "::error::tag v${tag} does not match package version ${version}"
-            exit 1
-          fi
-          echo "releasing websocket-tunnel ${version}"
 
       - name: Run tests
         run: uv run pytest -q

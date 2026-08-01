@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import re
 import tomllib
 from dataclasses import dataclass
@@ -31,6 +32,12 @@ class ServerConfig:
     tls_cert: str | None = None
     tls_key: str | None = None
     proxies: tuple[ProxyConfig, ...] = ()
+    max_connections: int = 0
+    # CIDR networks/addresses that peer-registered backends may target.
+    # Empty list = allow all (default for backward compatibility).
+    allow_peer_backends: tuple[str, ...] = ()
+    # CIDR networks/addresses that peers may ask this node to bind listeners on.
+    allow_peer_listens: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -40,12 +47,47 @@ class ClientConfig:
     tls: bool = False
     tls_skip_verify: bool = False
     proxies: tuple[ProxyConfig, ...] = ()
+    max_connections: int = 0
+    allow_peer_backends: tuple[str, ...] = ()
+    allow_peer_listens: tuple[str, ...] = ()
+
+
+def _parse_cidr_list(raw: Any, key: str) -> tuple[str, ...]:
+    """Validate a list of CIDR/IP strings from config."""
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise ConfigError(f"'{key}' must be a list of CIDR strings")
+    result = []
+    for item in raw:
+        if not isinstance(item, str):
+            raise ConfigError(f"'{key}' entries must be strings, got {item!r}")
+        try:
+            ipaddress.ip_network(item, strict=False)
+        except ValueError as exc:
+            raise ConfigError(f"invalid CIDR in '{key}': {item!r} — {exc}") from exc
+        result.append(item)
+    return tuple(result)
+
+
+def is_host_allowed(host: str, allowed_cidrs: tuple[str, ...]) -> bool:
+    """Return True when *host* falls within any of the allowed CIDR networks.
+
+    An empty *allowed_cidrs* list means "allow all".
+    """
+    if not allowed_cidrs:
+        return True
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        # Non-IP hostnames (e.g. "localhost") are never allowed when a whitelist
+        # is active — callers should resolve or use IP addresses in the config.
+        return False
+    return any(addr in ipaddress.ip_network(cidr, strict=False) for cidr in allowed_cidrs)
 
 
 def split_host_port(value: str) -> tuple[str, int]:
     """Split ``host:port`` (IPv6 literals must use ``[::1]:port`` form)."""
-    if not isinstance(value, str):
-        raise ConfigError(f"expected 'host:port', got {value!r}")
     match = _HOST_PORT_RE.match(value.strip())
     if match is None:
         raise ConfigError(f"invalid 'host:port' address: {value!r}")
@@ -116,6 +158,19 @@ def _load_toml(path: Path) -> dict[str, Any]:
     return data
 
 
+def _parse_max_connections(raw: Any) -> int:
+    if raw is None:
+        return 0
+    if not isinstance(raw, int) or raw < 0:
+        raise ConfigError("'max_connections' must be a non-negative integer (0 = unlimited)")
+    return raw
+
+
+def _resolve_token(cli_val: str | None, data: dict[str, Any]) -> str | None:
+    raw = data.get("token")
+    return cli_val if cli_val is not None else (str(raw) if raw is not None else None)
+
+
 def load_server_config(
     path: Path,
     *,
@@ -125,11 +180,9 @@ def load_server_config(
     tls_key: str | None = None,
 ) -> ServerConfig:
     data = _load_toml(path)
-    listen = listen if listen is not None else data.get("listen", "0.0.0.0:7000")
+    listen = listen if listen is not None else str(data.get("listen", "0.0.0.0:7000"))
     split_host_port(listen)
-    token = token if token is not None else data.get("token")
-    if token is not None and not isinstance(token, str):
-        raise ConfigError("'token' must be a string")
+    token = _resolve_token(token, data)
     tls_raw = data.get("tls")
     if tls_raw is None:
         tls_raw = {}
@@ -145,6 +198,9 @@ def load_server_config(
         tls_cert=tls_cert,
         tls_key=tls_key,
         proxies=_parse_proxies(data.get("proxies")),
+        max_connections=_parse_max_connections(data.get("max_connections")),
+        allow_peer_backends=_parse_cidr_list(data.get("allow_peer_backends"), "allow_peer_backends"),
+        allow_peer_listens=_parse_cidr_list(data.get("allow_peer_listens"), "allow_peer_listens"),
     )
 
 
@@ -157,11 +213,9 @@ def load_client_config(
     tls_skip_verify: bool | None = None,
 ) -> ClientConfig:
     data = _load_toml(path)
-    server = server if server is not None else data.get("server", "127.0.0.1:7000")
+    server = server if server is not None else str(data.get("server", "127.0.0.1:7000"))
     split_host_port(server)
-    token = token if token is not None else data.get("token")
-    if token is not None and not isinstance(token, str):
-        raise ConfigError("'token' must be a string")
+    token = _resolve_token(token, data)
     tls = tls if tls is not None else bool(data.get("tls", False))
     tls_skip_verify = tls_skip_verify if tls_skip_verify is not None else bool(data.get("tls_skip_verify", False))
     return ClientConfig(
@@ -170,4 +224,7 @@ def load_client_config(
         tls=tls,
         tls_skip_verify=tls_skip_verify,
         proxies=_parse_proxies(data.get("proxies")),
+        max_connections=_parse_max_connections(data.get("max_connections")),
+        allow_peer_backends=_parse_cidr_list(data.get("allow_peer_backends"), "allow_peer_backends"),
+        allow_peer_listens=_parse_cidr_list(data.get("allow_peer_listens"), "allow_peer_listens"),
     )

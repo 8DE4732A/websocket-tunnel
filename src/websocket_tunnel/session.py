@@ -15,7 +15,7 @@ import logging
 from typing import Any
 
 from . import __version__
-from .config import ConfigError, ProxyConfig, proxy_from_dict, split_host_port
+from .config import ConfigError, ProxyConfig, is_host_allowed, proxy_from_dict, split_host_port
 from .protocol import (
     DATA_CHUNK_SIZE,
     PROTOCOL_VERSION,
@@ -37,6 +37,14 @@ _COUNTER_MAX = 0x7FFFFFFF
 # it must be large enough to absorb a full-duplex burst so that one direction
 # of a relay can never deadlock the other.
 _FLOW_QUEUE_SIZE = 4096
+# Outbound priority-queue capacity.  Each entry is (priority, seq, frame).
+# Control frames use _PRIO_CTRL (0), data frames use _PRIO_DATA (1), so
+# STREAM_OPEN/CLOSE/ERROR are never head-of-line blocked by bulk data.
+# The monotonic seq counter breaks ties within the same priority to preserve
+# insertion order (avoids bytes comparison which would corrupt stream data).
+_PRIO_CTRL = 0
+_PRIO_DATA = 1
+_SEND_QUEUE_SIZE = 4096 + 256
 
 
 class Stream:
@@ -94,6 +102,8 @@ class Session:
         own_name: str,
         own_proxies: tuple[ProxyConfig, ...],
         token: str | None,
+        allow_peer_backends: tuple[str, ...] = (),
+        allow_peer_listens: tuple[str, ...] = (),
         ready_event: asyncio.Event,
         logger: logging.Logger,
     ) -> None:
@@ -102,9 +112,18 @@ class Session:
         self._own_name = own_name
         self._own_proxies = own_proxies
         self._token = token
+        self._allow_peer_backends = allow_peer_backends
+        self._allow_peer_listens = allow_peer_listens
         self._ready = ready_event
         self._log = logger
-        self._send_lock = asyncio.Lock()
+        # Single priority queue: entries are (priority, seq, frame).
+        # _PRIO_CTRL (0) sorts before _PRIO_DATA (1); seq preserves FIFO order
+        # within the same priority level (prevents bytes comparison).
+        self._send_queue: asyncio.PriorityQueue[tuple[int, int, bytes]] = asyncio.PriorityQueue(
+            maxsize=_SEND_QUEUE_SIZE
+        )
+        self._send_seq = 0
+        self._sender_task: asyncio.Task[None] | None = None
         self._proxies: dict[str, ProxyConfig] = {}
         self._listeners: dict[str, asyncio.AbstractServer] = {}
         self._streams: dict[int, Stream] = {}
@@ -123,12 +142,39 @@ class Session:
         task.add_done_callback(self._tasks.discard)
         return task
 
-    async def _send_frame(self, frame: bytes) -> None:
-        async with self._send_lock:
-            await self._ws.send(frame)
+    async def _ws_sender_loop(self) -> None:
+        """Single task that owns the WebSocket write path.
+
+        Dequeues frames from a PriorityQueue where control frames (_PRIO_CTRL=0)
+        sort before data frames (_PRIO_DATA=1), so STREAM_OPEN/CLOSE/ERROR/PROXY_*
+        are never head-of-line blocked by bulk TCP data.
+        """
+        try:
+            while True:
+                frame = (await self._send_queue.get())[2]
+                await self._ws.send(frame)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._log.debug("sender loop exited: %s", exc)
+
+    async def _enqueue(self, priority: int, frame: bytes) -> None:
+        self._send_seq += 1
+        await self._send_queue.put((priority, self._send_seq, frame))
 
     async def _send_control(self, message_type: MessageType, payload: dict[str, Any]) -> None:
-        await self._send_frame(encode_control(message_type, payload))
+        await self._enqueue(_PRIO_CTRL, encode_control(message_type, payload))
+
+    async def _send_stream_ctrl(self, message_type: MessageType, payload: dict[str, Any]) -> None:
+        """Send a stream-scoped control frame (STREAM_CLOSE / STREAM_ERROR) at data priority.
+
+        These frames must not leapfrog the data frames that preceded them on the
+        same stream, so they share the _PRIO_DATA bucket rather than _PRIO_CTRL.
+        """
+        await self._enqueue(_PRIO_DATA, encode_control(message_type, payload))
+
+    async def _send_data(self, stream_id: int, data: bytes) -> None:
+        await self._enqueue(_PRIO_DATA, encode_data(stream_id, data))
 
     async def _safe_send_control(self, message_type: MessageType, payload: dict[str, Any]) -> None:
         try:
@@ -137,7 +183,7 @@ class Session:
             self._log.debug("send %s failed: %s", message_type.name, exc)
 
     async def _send_error(self, stream_id: int, reason: str) -> None:
-        await self._safe_send_control(MessageType.STREAM_ERROR, {"stream_id": stream_id, "reason": reason})
+        await self._send_stream_ctrl(MessageType.STREAM_ERROR, {"stream_id": stream_id, "reason": reason})
 
     def _alloc_stream_id(self) -> int:
         # Stream ids must be unique across both nodes of a session, so each
@@ -170,6 +216,13 @@ class Session:
 
     # ------------------------------------------------------------ handshake
 
+    async def _direct_send(self, message_type: MessageType, payload: dict[str, Any]) -> None:
+        """Send a control frame directly to the WebSocket, bypassing the send queues.
+
+        Used only during the handshake phase before _ws_sender_loop is running.
+        """
+        await self._ws.send(encode_control(message_type, payload))
+
     async def _handshake(self) -> None:
         if self._role == "server":
             frame = await asyncio.wait_for(self._ws.recv(), HANDSHAKE_TIMEOUT)
@@ -177,18 +230,18 @@ class Session:
             if message_type is not MessageType.HELLO or not isinstance(payload, dict):
                 raise ConfigError(f"expected HELLO, got {message_type.name}")
             if payload.get("protocol") != PROTOCOL_VERSION:
-                await self._safe_send_control(MessageType.HELLO_ERROR, {"reason": "incompatible protocol version"})
+                await self._direct_send(MessageType.HELLO_ERROR, {"reason": "incompatible protocol version"})
                 raise ConfigError(f"incompatible protocol version: {payload.get('protocol')!r}")
             token = payload.get("token")
             if self._token is not None and (
                 not isinstance(token, str) or not hmac.compare_digest(token, self._token)
             ):
-                await self._safe_send_control(MessageType.HELLO_ERROR, {"reason": "authentication failed"})
+                await self._direct_send(MessageType.HELLO_ERROR, {"reason": "authentication failed"})
                 raise ConfigError("authentication failed")
             self._peer_name = str(payload.get("name", ""))
-            await self._send_control(MessageType.HELLO_OK, {"node": "server", "version": __version__})
+            await self._direct_send(MessageType.HELLO_OK, {"node": "server", "version": __version__})
         else:
-            await self._send_control(
+            await self._direct_send(
                 MessageType.HELLO,
                 {
                     "name": self._own_name,
@@ -247,6 +300,18 @@ class Session:
                 pass
         self._pending.pop(name, None)
 
+    def _check_peer_proxy_allowed(self, local: ProxyConfig) -> str | None:
+        """Return an error reason string if the peer-requested proxy is not allowed, else None."""
+        if local.listen_side == "local" and self._allow_peer_listens:
+            listen_host, _ = split_host_port(local.listen)
+            if not is_host_allowed(listen_host, self._allow_peer_listens):
+                return f"listen address {listen_host!r} not in allow_peer_listens"
+        if local.backend_side == "local" and self._allow_peer_backends:
+            backend_host, _ = split_host_port(local.backend)
+            if not is_host_allowed(backend_host, self._allow_peer_backends):
+                return f"backend address {backend_host!r} not in allow_peer_backends"
+        return None
+
     async def _handle_proxy_register(self, payload: dict[str, Any]) -> None:
         try:
             proxy = proxy_from_dict(payload)
@@ -266,6 +331,11 @@ class Session:
             backend=proxy.backend,
             backend_side=_flip_side(proxy.backend_side),
         )
+        denied = self._check_peer_proxy_allowed(local)
+        if denied:
+            self._log.warning("peer proxy '%s' rejected: %s", name, denied)
+            await self._safe_send_control(MessageType.PROXY_ERROR, {"name": name, "reason": denied})
+            return
         self._proxies[name] = local
         try:
             if local.listen_side == "local" and local.backend_side == "local":
@@ -373,8 +443,8 @@ class Session:
                 data = await reader.read(DATA_CHUNK_SIZE)
                 if not data:
                     break
-                await self._send_frame(encode_data(stream.stream_id, data))
-            await self._safe_send_control(MessageType.STREAM_CLOSE, {"stream_id": stream.stream_id})
+                await self._send_data(stream.stream_id, data)
+            await self._send_stream_ctrl(MessageType.STREAM_CLOSE, {"stream_id": stream.stream_id})
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -585,8 +655,6 @@ class Session:
         if message_type in (MessageType.PROXY_OK, MessageType.PROXY_ERROR):
             if isinstance(payload, dict):
                 await self._handle_proxy_result(message_type, payload)
-            return
-        self._log.warning("unhandled message: %s", message_type.name)
 
     async def _read_loop(self) -> None:
         try:
@@ -621,6 +689,7 @@ class Session:
             self._log.error("handshake failed: %s", exc)
             await self.close()
             return
+        self._sender_task = self._spawn(self._ws_sender_loop())
         self._spawn(self._ping_loop())
         self._read_task = self._spawn(self._read_loop())
         try:
@@ -650,7 +719,8 @@ class Session:
             task.cancel()
         if self._tasks:
             await asyncio.gather(*(t for t in self._tasks if t is not self._read_task), return_exceptions=True)
-        self._tasks.discard(self._read_task)
+        if self._read_task is not None:
+            self._tasks.discard(self._read_task)
         for server in list(self._listeners.values()):
             server.close()
         for server in list(self._listeners.values()):

@@ -22,6 +22,9 @@ class TunnelServer:
         self._sessions: set[Session] = set()
         self._stop_event = asyncio.Event()
         self.ready_event = asyncio.Event()
+        self._conn_sem: asyncio.Semaphore | None = (
+            asyncio.Semaphore(config.max_connections) if config.max_connections > 0 else None
+        )
 
     async def run(self) -> None:
         ssl_context = self._build_ssl()
@@ -55,12 +58,20 @@ class TunnelServer:
         return context
 
     async def _handle_connection(self, ws: ServerConnection) -> None:
+        if self._conn_sem is not None:
+            if self._conn_sem.locked():
+                self._log.warning("max_connections reached; rejecting new connection")
+                await ws.close()
+                return
+            await self._conn_sem.acquire()
         session = Session(
             ws,
             role="server",
             own_name="server",
             own_proxies=self._config.proxies,
             token=self._config.token,
+            allow_peer_backends=self._config.allow_peer_backends,
+            allow_peer_listens=self._config.allow_peer_listens,
             ready_event=self.ready_event,
             logger=self._log,
         )
@@ -69,6 +80,8 @@ class TunnelServer:
             await session.run()
         finally:
             self._sessions.discard(session)
+            if self._conn_sem is not None:
+                self._conn_sem.release()
 
     async def _close_sessions(self) -> None:
         sessions = list(self._sessions)

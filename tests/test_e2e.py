@@ -442,6 +442,113 @@ async def test_reconnect_after_server_drop():
 
 
 @pytest.mark.asyncio
+async def test_max_connections_rejects_excess():
+    """A second client is rejected when max_connections=1."""
+    server_port = free_port()
+    listen1 = free_port()
+    listen2 = free_port()
+    backend, backend_port = await start_echo()
+    server_cfg = ServerConfig(listen=f"{BACKEND}:{server_port}", token="t", max_connections=1)
+
+    def make_cfg(port: int) -> ClientConfig:
+        return ClientConfig(
+            server=f"{BACKEND}:{server_port}",
+            token="t",
+            proxies=(ProxyConfig(f"p{port}", f"{BACKEND}:{port}", "peer", f"{BACKEND}:{backend_port}", "local"),),
+        )
+
+    server = TunnelServer(server_cfg)
+    client1 = TunnelClient(make_cfg(listen1))
+    server_task = asyncio.create_task(server.run())
+    client1_task = asyncio.create_task(client1.run())
+    try:
+        # client1 must be fully ready before client2 is started so it wins the slot.
+        await wait_ready(client1)
+        assert await echo_once(listen1, b"ok") == b"ok"
+
+        client2 = TunnelClient(make_cfg(listen2))
+        client2_task = asyncio.create_task(client2.run())
+        try:
+            # client2 should never become ready; the only slot is taken.
+            with pytest.raises(TimeoutError):
+                await wait_ready(client2, timeout=2.5)
+        finally:
+            await client2.stop()
+            await asyncio.gather(client2_task, return_exceptions=True)
+    finally:
+        await client1.stop()
+        await server.stop()
+        await asyncio.gather(client1_task, server_task, return_exceptions=True)
+        backend.close()
+        await backend.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_allow_peer_listens_blocks_denied_proxy():
+    """Server rejects a client proxy that asks the server to bind outside allow_peer_listens."""
+    server_port = free_port()
+    listen_port = free_port()
+    # Server only allows binding on 10.0.0.0/8; client asks to bind on 127.0.0.1.
+    server_cfg = ServerConfig(
+        listen=f"{BACKEND}:{server_port}",
+        token="t",
+        allow_peer_listens=("10.0.0.0/8",),
+    )
+    # Classic proxy: listen on server (peer from client's view), backend on client (local).
+    client_cfg = ClientConfig(
+        server=f"{BACKEND}:{server_port}",
+        token="t",
+        proxies=(ProxyConfig("blocked", f"{BACKEND}:{listen_port}", "peer", f"{BACKEND}:9999", "local"),),
+    )
+    server = TunnelServer(server_cfg)
+    client = TunnelClient(client_cfg)
+    server_task = asyncio.create_task(server.run())
+    client_task = asyncio.create_task(client.run())
+    try:
+        # Session is established but server rejects the proxy; listener is never bound.
+        await wait_ready(client)
+        with pytest.raises(OSError):
+            await asyncio.wait_for(asyncio.open_connection(BACKEND, listen_port), timeout=1.0)
+    finally:
+        await client.stop()
+        await server.stop()
+        await asyncio.gather(client_task, server_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_allow_peer_backends_blocks_denied_proxy():
+    """Server rejects a client proxy whose backend (dialed by server) is outside allow_peer_backends."""
+    server_port = free_port()
+    listen_port = free_port()
+    # Reverse proxy: listen on client (local from client's view), backend on server (peer from client).
+    # After flip on server: listen_side=peer (client binds), backend_side=local (server dials).
+    # Server only allows dialing 127.0.0.1/32; client asks server to dial 10.0.0.1.
+    server_cfg = ServerConfig(
+        listen=f"{BACKEND}:{server_port}",
+        token="t",
+        allow_peer_backends=("127.0.0.1/32",),
+    )
+    client_cfg = ClientConfig(
+        server=f"{BACKEND}:{server_port}",
+        token="t",
+        proxies=(ProxyConfig("blocked", f"{BACKEND}:{listen_port}", "local", "10.0.0.1:9999", "peer"),),
+    )
+    server = TunnelServer(server_cfg)
+    client = TunnelClient(client_cfg)
+    server_task = asyncio.create_task(server.run())
+    client_task = asyncio.create_task(client.run())
+    try:
+        # Session is established but server rejects the proxy; listener on client is never bound.
+        await wait_ready(client)
+        with pytest.raises(OSError):
+            await asyncio.wait_for(asyncio.open_connection(BACKEND, listen_port), timeout=1.0)
+    finally:
+        await client.stop()
+        await server.stop()
+        await asyncio.gather(client_task, server_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_two_clients():
     backend, backend_port = await start_echo()
     server_port = free_port()

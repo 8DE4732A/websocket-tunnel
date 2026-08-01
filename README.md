@@ -69,6 +69,15 @@ listen = "0.0.0.0:7000"          # 控制端口（ws/wss）
 token = "secret"                 # 可选，共享认证 token
 tls = { cert = "server.crt", key = "server.key" }   # 可选，启用 wss
 
+# 最大并发控制连接数（0 = 不限）
+max_connections = 10
+
+# 允许 client 请求本节点连接的 backend IP 范围（CIDR 列表，空 = 允许所有）
+allow_peer_backends = ["127.0.0.1/32", "10.0.0.0/8"]
+
+# 允许 client 请求本节点绑定的 listen IP 范围（空 = 允许所有）
+allow_peer_listens = ["0.0.0.0/0", "::/0"]
+
 [[proxies]]
 name = "web"
 listen = "0.0.0.0:8080"
@@ -85,6 +94,12 @@ token = "secret"
 tls = false                      # true 时使用 wss
 tls_skip_verify = false          # 自签证书时设为 true
 
+# 允许服务端请求本节点连接的 backend IP 范围（CIDR 列表，空 = 允许所有）
+allow_peer_backends = ["127.0.0.1/32"]
+
+# 允许服务端请求本节点绑定的 listen IP 范围（空 = 允许所有）
+allow_peer_listens = ["127.0.0.1/32"]
+
 [[proxies]]
 name = "web"
 listen = "0.0.0.0:8080"
@@ -93,8 +108,9 @@ backend = "127.0.0.1:3000"
 backend_side = "local"
 ```
 
-`listen` / `backend` 均为 `host:port`，IPv6 使用 `[::1]:8080` 形式。backend 可以
-指向任意可达地址（含内网 IP 的外部服务端口），不限于 localhost。
+`listen` / `backend` 均为 `host:port`，IPv6 使用 `[::1]:8080` 形式。`allow_peer_*`
+白名单中的地址必须使用 IP（不支持主机名），CIDR 掩码可省略（如 `"10.0.0.1"`
+等同于 `"10.0.0.1/32"`）。
 
 ## 传输与协议概要
 
@@ -130,6 +146,16 @@ PyPI 项目页配置 Trusted Publisher：仓库 `8DE4732A/websocket-tunnel`、
 
 ## 安全说明
 
-共享 token 即信任边界：持有 token 的 client 可以请求服务端绑定任意监听端口。
-公网部署请务必启用 wss（或搭配其他加密隧道）并妥善保管 token。v1 暂不提供
-mTLS、证书固定与配置热加载。
+**连接数限制**：服务端 `max_connections` 防止恶意客户端通过大量控制连接耗尽资源。
+建议生产部署时设置一个合理上限（如 `10`）。
+
+**后端 / 监听白名单**：默认配置下，持有 token 的对端可请求本节点连接任意 IP 或
+绑定任意端口，这在可信局域网内往往是期望行为。若部署于半信任网络，应配置
+`allow_peer_backends` 将出站连接限定为必要的内网 CIDR，并用 `allow_peer_listens`
+约束监听 IP，以防内网探测（SSRF）与端口滥用。
+
+**传输加密**：token 在握手时以明文 JSON 传输。公网部署请务必启用 wss（配置
+`tls.cert` / `tls.key`）；`tls_skip_verify = true` 仅适用于受控的自签证书环境，
+生产环境应使用受信任 CA 签发的证书。
+
+v1 暂不提供 mTLS、证书固定与配置热加载。

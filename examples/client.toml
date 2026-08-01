@@ -6,6 +6,16 @@ token = "change-me"
 # tls = true
 # tls_skip_verify = true
 
+# Reject new control connections once this many server-side sessions are active.
+# 0 (default) = unlimited. (Rarely needed on the client side.)
+# max_connections = 1
+
+# Restrict which backend IPs the server may ask this client to reach.
+# allow_peer_backends = ["127.0.0.1/32"]
+
+# Restrict which listener IPs the server may ask this client to bind.
+# allow_peer_listens = ["127.0.0.1/32"]
+
 # Proxies are declared from the client's point of view: "local" = this node
 # (the client), "peer" = the other node (the tunnel server).
 

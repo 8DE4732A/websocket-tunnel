@@ -1,6 +1,6 @@
 [project]
 name = "websocket-tunnel"
-version = "0.1.0"
+dynamic = ["version"]
 description = "A frp-like intranet penetration tool with WebSocket transport (TCP passthrough)."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -14,8 +14,14 @@ dependencies = [
 wtunnel = "websocket_tunnel.cli:main"
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.build.hooks.vcs]
+version-file = "src/websocket_tunnel/_version.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/websocket_tunnel"]

@@ -57,6 +57,8 @@ class TunnelClient:
                 own_name="client",
                 own_proxies=self._config.proxies,
                 token=self._config.token,
+                allow_peer_backends=self._config.allow_peer_backends,
+                allow_peer_listens=self._config.allow_peer_listens,
                 ready_event=self.ready_event,
                 logger=self._log,
             )
