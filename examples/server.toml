@@ -1,0 +1,27 @@
+# Tunnel server configuration.
+listen = "0.0.0.0:7000"
+token = "change-me"
+
+# Optional TLS (wss). Uncomment and provide cert/key files to enable.
+# tls = { cert = "server.crt", key = "server.key" }
+
+# The server may also declare proxies. Sides are relative to the declaring
+# node: "local" = this node, "peer" = the other node (the connected client).
+
+# Example: expose a service that runs on the SERVER's machine through the
+# tunnel, listening on the CLIENT's machine at 127.0.0.1:3307.
+[[proxies]]
+name = "mysql-on-server"
+listen = "127.0.0.1:3307"
+listen_side = "peer"
+backend = "127.0.0.1:3306"
+backend_side = "local"
+
+# Example: a classic frp-style forward declared by the server
+# (listener on the server, backend on the client):
+# [[proxies]]
+# name = "web-on-client"
+# listen = "0.0.0.0:8080"
+# listen_side = "local"
+# backend = "127.0.0.1:3000"
+# backend_side = "peer"

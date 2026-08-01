@@ -1,0 +1,28 @@
+# Tunnel client configuration.
+server = "127.0.0.1:7000"
+token = "change-me"
+
+# Use wss transport and skip certificate verification (self-signed certs).
+# tls = true
+# tls_skip_verify = true
+
+# Proxies are declared from the client's point of view: "local" = this node
+# (the client), "peer" = the other node (the tunnel server).
+
+# Classic frp scenario: expose a service on the client's machine at a port
+# on the server (0.0.0.0:8080 here).
+[[proxies]]
+name = "web"
+listen = "0.0.0.0:8080"
+listen_side = "peer"
+backend = "127.0.0.1:3000"
+backend_side = "local"
+
+# Reverse scenario: listen on the client's machine and forward to a service
+# on the server's machine.
+# [[proxies]]
+# name = "db-on-server"
+# listen = "127.0.0.1:3307"
+# listen_side = "local"
+# backend = "127.0.0.1:3306"
+# backend_side = "peer"
