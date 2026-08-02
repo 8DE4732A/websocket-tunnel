@@ -581,3 +581,69 @@ async def test_two_clients():
         await asyncio.gather(client1_task, client2_task, server_task, return_exceptions=True)
         backend.close()
         await backend.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_challenge_response_correct_token():
+    """客户端用正确 token 能完成 challenge-response 握手并建立会话。"""
+    server_port = free_port()
+    backend, backend_port = await start_echo()
+    listen_port = free_port()
+    server_cfg = ServerConfig(listen=f"{BACKEND}:{server_port}", token="s3cr3t")
+    client_cfg = ClientConfig(
+        server=f"{BACKEND}:{server_port}",
+        token="s3cr3t",
+        proxies=(ProxyConfig("echo", f"{BACKEND}:{listen_port}", "peer", f"{BACKEND}:{backend_port}", "local"),),
+    )
+    server = TunnelServer(server_cfg)
+    client = TunnelClient(client_cfg)
+    server_task = asyncio.create_task(server.run())
+    client_task = asyncio.create_task(client.run())
+    try:
+        await wait_ready(client)
+        data = await echo_once(listen_port, b"hello-cr")
+        assert data == b"hello-cr"
+    finally:
+        await cleanup(server, client, server_task, client_task)
+        backend.close()
+        await backend.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_challenge_response_wrong_token_rejected():
+    """客户端用错误 token 计算的 HMAC 响应应被服务端拒绝。"""
+    server_port = free_port()
+    server_cfg = ServerConfig(listen=f"{BACKEND}:{server_port}", token="correct")
+    client_cfg = ClientConfig(server=f"{BACKEND}:{server_port}", token="wrong")
+    server = TunnelServer(server_cfg)
+    client = TunnelClient(client_cfg)
+    server_task = asyncio.create_task(server.run())
+    client_task = asyncio.create_task(client.run())
+    with pytest.raises(TimeoutError):
+        await wait_ready(client, timeout=2.5)
+    await cleanup(server, client, server_task, client_task)
+
+
+@pytest.mark.asyncio
+async def test_challenge_response_no_token_server():
+    """服务端不配置 token 时，任何客户端均可连接（向后兼容无认证模式）。"""
+    server_port = free_port()
+    backend, backend_port = await start_echo()
+    listen_port = free_port()
+    server_cfg = ServerConfig(listen=f"{BACKEND}:{server_port}")
+    client_cfg = ClientConfig(
+        server=f"{BACKEND}:{server_port}",
+        proxies=(ProxyConfig("echo", f"{BACKEND}:{listen_port}", "peer", f"{BACKEND}:{backend_port}", "local"),),
+    )
+    server = TunnelServer(server_cfg)
+    client = TunnelClient(client_cfg)
+    server_task = asyncio.create_task(server.run())
+    client_task = asyncio.create_task(client.run())
+    try:
+        await wait_ready(client)
+        data = await echo_once(listen_port, b"no-auth")
+        assert data == b"no-auth"
+    finally:
+        await cleanup(server, client, server_task, client_task)
+        backend.close()
+        await backend.wait_closed()

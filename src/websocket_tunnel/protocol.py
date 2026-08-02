@@ -18,6 +18,7 @@ class MessageType(IntEnum):
     HELLO = 1
     HELLO_OK = 2
     HELLO_ERROR = 3
+    HELLO_CHALLENGE = 15
     PROXY_REGISTER = 4
     PROXY_OK = 5
     PROXY_ERROR = 6
@@ -31,7 +32,7 @@ class MessageType(IntEnum):
     PONG = 14
 
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 DATA_CHUNK_SIZE = 32 * 1024
 MAX_CONTROL_SIZE = 1 << 20
 STREAM_ID_SIZE = 4

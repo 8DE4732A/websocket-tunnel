@@ -10,8 +10,10 @@ backends are dialed.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import hmac
 import logging
+import secrets
 from typing import Any
 
 from . import __version__
@@ -225,29 +227,42 @@ class Session:
 
     async def _handshake(self) -> None:
         if self._role == "server":
+            nonce = secrets.token_hex(32)
+            await self._direct_send(
+                MessageType.HELLO_CHALLENGE,
+                {"nonce": nonce, "protocol": PROTOCOL_VERSION},
+            )
             frame = await asyncio.wait_for(self._ws.recv(), HANDSHAKE_TIMEOUT)
             message_type, payload = decode(frame)
             if message_type is not MessageType.HELLO or not isinstance(payload, dict):
                 raise ConfigError(f"expected HELLO, got {message_type.name}")
-            if payload.get("protocol") != PROTOCOL_VERSION:
-                await self._direct_send(MessageType.HELLO_ERROR, {"reason": "incompatible protocol version"})
-                raise ConfigError(f"incompatible protocol version: {payload.get('protocol')!r}")
-            token = payload.get("token")
-            if self._token is not None and (
-                not isinstance(token, str) or not hmac.compare_digest(token, self._token)
-            ):
-                await self._direct_send(MessageType.HELLO_ERROR, {"reason": "authentication failed"})
-                raise ConfigError("authentication failed")
+            if self._token is not None:
+                response = payload.get("response")
+                expected = hmac.new(
+                    self._token.encode("utf-8"), nonce.encode("utf-8"), hashlib.sha256
+                ).hexdigest()
+                if not isinstance(response, str) or not hmac.compare_digest(response, expected):
+                    await self._direct_send(MessageType.HELLO_ERROR, {"reason": "authentication failed"})
+                    raise ConfigError("authentication failed")
             self._peer_name = str(payload.get("name", ""))
             await self._direct_send(MessageType.HELLO_OK, {"node": "server", "version": __version__})
         else:
+            frame = await asyncio.wait_for(self._ws.recv(), HANDSHAKE_TIMEOUT)
+            message_type, payload = decode(frame)
+            if message_type is not MessageType.HELLO_CHALLENGE or not isinstance(payload, dict):
+                raise ConfigError(f"expected HELLO_CHALLENGE, got {message_type.name}")
+            if payload.get("protocol") != PROTOCOL_VERSION:
+                raise ConfigError(f"incompatible protocol version: {payload.get('protocol')!r}")
+            nonce = str(payload.get("nonce", ""))
+            response = hmac.new(
+                (self._token or "").encode("utf-8"), nonce.encode("utf-8"), hashlib.sha256
+            ).hexdigest()
             await self._direct_send(
                 MessageType.HELLO,
                 {
                     "name": self._own_name,
-                    "token": self._token or "",
+                    "response": response,
                     "version": __version__,
-                    "protocol": PROTOCOL_VERSION,
                 },
             )
             frame = await asyncio.wait_for(self._ws.recv(), HANDSHAKE_TIMEOUT)
@@ -621,7 +636,7 @@ class Session:
         if message_type is MessageType.PING:
             await self._safe_send_control(MessageType.PONG, {})
             return
-        if message_type in (MessageType.PONG, MessageType.HELLO, MessageType.HELLO_OK, MessageType.HELLO_ERROR):
+        if message_type in (MessageType.PONG, MessageType.HELLO, MessageType.HELLO_OK, MessageType.HELLO_ERROR, MessageType.HELLO_CHALLENGE):
             return
         if message_type is MessageType.STREAM_DATA:
             stream_id, chunk = payload
