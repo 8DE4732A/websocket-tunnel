@@ -9,12 +9,13 @@ token = "change-me"
 # Optional TLS (wss). Uncomment and provide cert/key files to enable.
 # tls = { cert = "server.crt", key = "server.key" }
 
-# Restrict which backend IPs a connected client may ask this server to reach.
-# Listed as CIDR blocks; empty list (default) allows all destinations.
-# allow_peer_backends = ["127.0.0.1/32", "10.0.0.0/8"]
+# Restrict which backend IPs/ports a connected client may ask this server to reach.
+# Format: CIDR, CIDR:port, CIDR:start-end, CIDR:port,port,start-end
+# Empty list (default) allows all destinations.
+# allow_peer_backends = ["127.0.0.1/32:8000-9000", "10.0.0.0/8"]
 
-# Restrict which listener IPs a connected client may ask this server to bind.
-# allow_peer_listens = ["0.0.0.0/0", "::/0"]
+# Restrict which listener IPs/ports a connected client may ask this server to bind.
+# allow_peer_listens = ["0.0.0.0/0:9000-9100"]
 
 # The server may also declare proxies. Sides are relative to the declaring
 # node: "local" = this node, "peer" = the other node (the connected client).
