@@ -121,8 +121,21 @@ def test_is_endpoint_allowed():
     assert is_endpoint_allowed("10.1.2.3", 9001, rules_r) is False
     assert is_endpoint_allowed("192.168.1.1", 8080, rules_r) is False
 
+    # Comma-separated ports.
+    rules_c = _parse_allow_rules(["127.0.0.1/32:8317,8319"], "x")
+    assert is_endpoint_allowed("127.0.0.1", 8317, rules_c) is True
+    assert is_endpoint_allowed("127.0.0.1", 8319, rules_c) is True
+    assert is_endpoint_allowed("127.0.0.1", 8318, rules_c) is False
+
+    # Mixed: comma + range.
+    rules_m = _parse_allow_rules(["10.0.0.0/8:80,443,8000-8100"], "x")
+    assert is_endpoint_allowed("10.0.0.1", 80, rules_m) is True
+    assert is_endpoint_allowed("10.0.0.1", 443, rules_m) is True
+    assert is_endpoint_allowed("10.0.0.1", 8050, rules_m) is True
+    assert is_endpoint_allowed("10.0.0.1", 8101, rules_m) is False
+
     # Mixed rules: CIDR-only + port-restricted.
-    mixed = _parse_allow_rules(["192.168.0.0/16", "127.0.0.1/32:2222-2222"], "x")
+    mixed = _parse_allow_rules(["192.168.0.0/16", "127.0.0.1/32:2222"], "x")
     assert is_endpoint_allowed("192.168.1.1", 9999, mixed) is True
     assert is_endpoint_allowed("127.0.0.1", 2222, mixed) is True
     assert is_endpoint_allowed("127.0.0.1", 22, mixed) is False
@@ -145,7 +158,7 @@ def test_parse_allow_rules_errors(tmp_path):
 
     # Port out of range.
     path.write_text('listen = "0.0.0.0:7000"\nallow_peer_backends = ["127.0.0.1/32:0"]\n')
-    with pytest.raises(ConfigError, match="invalid port range"):
+    with pytest.raises(ConfigError, match="invalid port"):
         load_server_config(path)
 
 

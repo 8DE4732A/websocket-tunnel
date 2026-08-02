@@ -10,8 +10,8 @@ from pathlib import Path
 from typing import Any
 
 _HOST_PORT_RE = re.compile(r"^(\[[^\[\]]+\]|[^:]+):([0-9]+)$")
-# Matches optional ":port" or ":start-end" suffix on an allow-rule string.
-_RULE_PORT_RE = re.compile(r"^(.+):(\d+)(?:-(\d+))?$")
+# Matches a trailing ":ports" suffix where ports = comma/range spec, e.g. ":22" ":8000-9000" ":22,80,443" ":8000-8100,9000"
+_RULE_PORT_RE = re.compile(r"^(.+):([0-9][0-9,\-]*)$")
 
 
 class ConfigError(Exception):
@@ -22,17 +22,20 @@ class ConfigError(Exception):
 class AllowRule:
     """A single entry in allow_peer_backends / allow_peer_listens.
 
-    ``cidr``       — an IP network (e.g. ``127.0.0.1/32``, ``10.0.0.0/8``).
-    ``port_min``   — lower bound of allowed ports (1 when absent).
-    ``port_max``   — upper bound of allowed ports (65535 when absent).
+    ``cidr``  — an IP network (e.g. ``127.0.0.1/32``, ``10.0.0.0/8``).
+    ``ports`` — frozenset of allowed port numbers; empty means all ports.
+    ``raw``   — original config string, preserved for error messages.
 
-    The original string form ``"cidr[:port[-port]]"`` is preserved in
-    ``raw`` for error messages and round-tripping.
+    Supported config formats:
+      ``"10.0.0.0/8"``                 — all ports
+      ``"127.0.0.1/32:22"``            — single port
+      ``"127.0.0.1/32:8000-9000"``     — port range
+      ``"127.0.0.1/32:22,8317,8319"``  — comma-separated ports
+      ``"10.0.0.0/8:80,443,8000-8100"``— mixed
     """
 
     cidr: str
-    port_min: int
-    port_max: int
+    ports: frozenset[int]  # empty = all ports allowed
     raw: str
 
 
@@ -72,23 +75,56 @@ class ClientConfig:
     allow_peer_listens: tuple[AllowRule, ...] = ()
 
 
+def _parse_port_spec(spec: str, key: str, raw: str) -> frozenset[int]:
+    """Parse a port specification string into a frozenset of port numbers.
+
+    Accepts comma-separated tokens where each token is either a single port
+    number or a ``start-end`` range (inclusive).  Examples::
+
+        "22"            → {22}
+        "8000-9000"     → {8000, 8001, …, 9000}
+        "22,8317,8319"  → {22, 8317, 8319}
+        "80,443,8000-8100" → {80, 443, 8000…8100}
+    """
+    ports: set[int] = set()
+    for token in spec.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if "-" in token:
+            parts = token.split("-", 1)
+            try:
+                lo, hi = int(parts[0]), int(parts[1])
+            except ValueError:
+                raise ConfigError(f"invalid port range {token!r} in '{key}': {raw!r}")
+            if not (1 <= lo <= 65535 and 1 <= hi <= 65535 and lo <= hi):
+                raise ConfigError(f"invalid port range {token!r} in '{key}': {raw!r}")
+            ports.update(range(lo, hi + 1))
+        else:
+            try:
+                p = int(token)
+            except ValueError:
+                raise ConfigError(f"invalid port {token!r} in '{key}': {raw!r}")
+            if not 1 <= p <= 65535:
+                raise ConfigError(f"invalid port {token!r} in '{key}': {raw!r}")
+            ports.add(p)
+    return frozenset(ports)
+
+
 def _parse_allow_rule(item: str, key: str) -> AllowRule:
     """Parse one allow-rule string into an AllowRule.
 
-    Accepted formats (backward-compatible):
-      ``"10.0.0.0/8"``          — CIDR only, all ports allowed
-      ``"127.0.0.1/32:22"``     — CIDR + single port
-      ``"127.0.0.1/32:8000-9000"`` — CIDR + port range
-    IPv6 CIDRs must NOT use bracket notation here; they are plain strings
-    (e.g. ``"::1/128"`` or ``"::1/128:80"``).
+    Accepted formats (all backward-compatible):
+      ``"10.0.0.0/8"``                  — CIDR only, all ports allowed
+      ``"127.0.0.1/32:22"``             — single port
+      ``"127.0.0.1/32:8000-9000"``      — port range
+      ``"127.0.0.1/32:22,8317,8319"``   — comma list
+      ``"10.0.0.0/8:80,443,8000-8100"`` — mixed
     """
     if not isinstance(item, str):
         raise ConfigError(f"'{key}' entries must be strings, got {item!r}")
 
-    # Try to split off a trailing :port or :start-end.
-    # We try the longest possible CIDR match first: if the string contains
-    # a port suffix it will have at least two colons (IPv4) or be IPv6.
-    port_min, port_max = 1, 65535
+    ports: frozenset[int] = frozenset()
     cidr_part = item
 
     m = _RULE_PORT_RE.match(item)
@@ -96,16 +132,13 @@ def _parse_allow_rule(item: str, key: str) -> AllowRule:
         candidate_cidr = m.group(1)
         try:
             ipaddress.ip_network(candidate_cidr, strict=False)
-            # Valid CIDR before the port suffix — parse the port range.
-            p_start = int(m.group(2))
-            p_end = int(m.group(3)) if m.group(3) is not None else p_start
-            if not (1 <= p_start <= 65535 and 1 <= p_end <= 65535 and p_start <= p_end):
-                raise ConfigError(f"invalid port range in '{key}': {item!r}")
+            # Valid CIDR — the rest is the port spec.
+            ports = _parse_port_spec(m.group(2), key, item)
             cidr_part = candidate_cidr
-            port_min, port_max = p_start, p_end
-        except ValueError:
-            # The regex matched but the prefix isn't a valid CIDR —
-            # fall through and validate the whole string as a plain CIDR.
+        except (ValueError, ConfigError) as exc:
+            if isinstance(exc, ConfigError):
+                raise
+            # Prefix isn't a valid CIDR — try the whole string as a plain CIDR.
             pass
 
     try:
@@ -113,7 +146,7 @@ def _parse_allow_rule(item: str, key: str) -> AllowRule:
     except ValueError as exc:
         raise ConfigError(f"invalid CIDR in '{key}': {item!r} — {exc}") from exc
 
-    return AllowRule(cidr=cidr_part, port_min=port_min, port_max=port_max, raw=item)
+    return AllowRule(cidr=cidr_part, ports=ports, raw=item)
 
 
 def _parse_allow_rules(raw: Any, key: str) -> tuple[AllowRule, ...]:
@@ -138,14 +171,13 @@ def is_endpoint_allowed(host: str, port: int, rules: tuple[AllowRule, ...]) -> b
     except ValueError:
         return False
     return any(
-        addr in ipaddress.ip_network(r.cidr, strict=False) and r.port_min <= port <= r.port_max
+        addr in ipaddress.ip_network(r.cidr, strict=False)
+        and (not r.ports or port in r.ports)
         for r in rules
     )
 
 
 # Backward-compatible alias for callers that only check the host.
-# With port-restricted rules port=0 never falls in any valid range,
-# so callers that need port checking must use is_endpoint_allowed directly.
 def is_host_allowed(host: str, rules: tuple[AllowRule, ...]) -> bool:
     """Deprecated alias; use is_endpoint_allowed with an explicit port."""
     if not rules:
