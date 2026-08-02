@@ -10,10 +10,30 @@ from pathlib import Path
 from typing import Any
 
 _HOST_PORT_RE = re.compile(r"^(\[[^\[\]]+\]|[^:]+):([0-9]+)$")
+# Matches optional ":port" or ":start-end" suffix on an allow-rule string.
+_RULE_PORT_RE = re.compile(r"^(.+):(\d+)(?:-(\d+))?$")
 
 
 class ConfigError(Exception):
     """Raised when a configuration file or value is invalid."""
+
+
+@dataclass(frozen=True)
+class AllowRule:
+    """A single entry in allow_peer_backends / allow_peer_listens.
+
+    ``cidr``       — an IP network (e.g. ``127.0.0.1/32``, ``10.0.0.0/8``).
+    ``port_min``   — lower bound of allowed ports (1 when absent).
+    ``port_max``   — upper bound of allowed ports (65535 when absent).
+
+    The original string form ``"cidr[:port[-port]]"`` is preserved in
+    ``raw`` for error messages and round-tripping.
+    """
+
+    cidr: str
+    port_min: int
+    port_max: int
+    raw: str
 
 
 @dataclass(frozen=True)
@@ -33,11 +53,11 @@ class ServerConfig:
     tls_key: str | None = None
     proxies: tuple[ProxyConfig, ...] = ()
     max_connections: int = 0
-    # CIDR networks/addresses that peer-registered backends may target.
+    # Rules controlling which backends a peer may ask this node to reach.
     # Empty list = allow all (default for backward compatibility).
-    allow_peer_backends: tuple[str, ...] = ()
-    # CIDR networks/addresses that peers may ask this node to bind listeners on.
-    allow_peer_listens: tuple[str, ...] = ()
+    allow_peer_backends: tuple[AllowRule, ...] = ()
+    # Rules controlling which listen addresses a peer may ask this node to bind.
+    allow_peer_listens: tuple[AllowRule, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -48,42 +68,93 @@ class ClientConfig:
     tls_skip_verify: bool = False
     proxies: tuple[ProxyConfig, ...] = ()
     max_connections: int = 0
-    allow_peer_backends: tuple[str, ...] = ()
-    allow_peer_listens: tuple[str, ...] = ()
+    allow_peer_backends: tuple[AllowRule, ...] = ()
+    allow_peer_listens: tuple[AllowRule, ...] = ()
 
 
-def _parse_cidr_list(raw: Any, key: str) -> tuple[str, ...]:
-    """Validate a list of CIDR/IP strings from config."""
+def _parse_allow_rule(item: str, key: str) -> AllowRule:
+    """Parse one allow-rule string into an AllowRule.
+
+    Accepted formats (backward-compatible):
+      ``"10.0.0.0/8"``          — CIDR only, all ports allowed
+      ``"127.0.0.1/32:22"``     — CIDR + single port
+      ``"127.0.0.1/32:8000-9000"`` — CIDR + port range
+    IPv6 CIDRs must NOT use bracket notation here; they are plain strings
+    (e.g. ``"::1/128"`` or ``"::1/128:80"``).
+    """
+    if not isinstance(item, str):
+        raise ConfigError(f"'{key}' entries must be strings, got {item!r}")
+
+    # Try to split off a trailing :port or :start-end.
+    # We try the longest possible CIDR match first: if the string contains
+    # a port suffix it will have at least two colons (IPv4) or be IPv6.
+    port_min, port_max = 1, 65535
+    cidr_part = item
+
+    m = _RULE_PORT_RE.match(item)
+    if m:
+        candidate_cidr = m.group(1)
+        try:
+            ipaddress.ip_network(candidate_cidr, strict=False)
+            # Valid CIDR before the port suffix — parse the port range.
+            p_start = int(m.group(2))
+            p_end = int(m.group(3)) if m.group(3) is not None else p_start
+            if not (1 <= p_start <= 65535 and 1 <= p_end <= 65535 and p_start <= p_end):
+                raise ConfigError(f"invalid port range in '{key}': {item!r}")
+            cidr_part = candidate_cidr
+            port_min, port_max = p_start, p_end
+        except ValueError:
+            # The regex matched but the prefix isn't a valid CIDR —
+            # fall through and validate the whole string as a plain CIDR.
+            pass
+
+    try:
+        ipaddress.ip_network(cidr_part, strict=False)
+    except ValueError as exc:
+        raise ConfigError(f"invalid CIDR in '{key}': {item!r} — {exc}") from exc
+
+    return AllowRule(cidr=cidr_part, port_min=port_min, port_max=port_max, raw=item)
+
+
+def _parse_allow_rules(raw: Any, key: str) -> tuple[AllowRule, ...]:
+    """Validate a list of allow-rule strings from config."""
     if raw is None:
         return ()
     if not isinstance(raw, list):
-        raise ConfigError(f"'{key}' must be a list of CIDR strings")
-    result = []
-    for item in raw:
-        if not isinstance(item, str):
-            raise ConfigError(f"'{key}' entries must be strings, got {item!r}")
-        try:
-            ipaddress.ip_network(item, strict=False)
-        except ValueError as exc:
-            raise ConfigError(f"invalid CIDR in '{key}': {item!r} — {exc}") from exc
-        result.append(item)
-    return tuple(result)
+        raise ConfigError(f"'{key}' must be a list of strings")
+    return tuple(_parse_allow_rule(item, key) for item in raw)
 
 
-def is_host_allowed(host: str, allowed_cidrs: tuple[str, ...]) -> bool:
-    """Return True when *host* falls within any of the allowed CIDR networks.
+def is_endpoint_allowed(host: str, port: int, rules: tuple[AllowRule, ...]) -> bool:
+    """Return True when ``host:port`` matches any rule.
 
-    An empty *allowed_cidrs* list means "allow all".
+    Empty *rules* means "allow all" (backward-compatible default).
+    Non-IP hostnames are always denied when a whitelist is active.
     """
-    if not allowed_cidrs:
+    if not rules:
         return True
     try:
         addr = ipaddress.ip_address(host)
     except ValueError:
-        # Non-IP hostnames (e.g. "localhost") are never allowed when a whitelist
-        # is active — callers should resolve or use IP addresses in the config.
         return False
-    return any(addr in ipaddress.ip_network(cidr, strict=False) for cidr in allowed_cidrs)
+    return any(
+        addr in ipaddress.ip_network(r.cidr, strict=False) and r.port_min <= port <= r.port_max
+        for r in rules
+    )
+
+
+# Backward-compatible alias for callers that only check the host.
+# With port-restricted rules port=0 never falls in any valid range,
+# so callers that need port checking must use is_endpoint_allowed directly.
+def is_host_allowed(host: str, rules: tuple[AllowRule, ...]) -> bool:
+    """Deprecated alias; use is_endpoint_allowed with an explicit port."""
+    if not rules:
+        return True
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return any(addr in ipaddress.ip_network(r.cidr, strict=False) for r in rules)
 
 
 def split_host_port(value: str) -> tuple[str, int]:
@@ -199,8 +270,8 @@ def load_server_config(
         tls_key=tls_key,
         proxies=_parse_proxies(data.get("proxies")),
         max_connections=_parse_max_connections(data.get("max_connections")),
-        allow_peer_backends=_parse_cidr_list(data.get("allow_peer_backends"), "allow_peer_backends"),
-        allow_peer_listens=_parse_cidr_list(data.get("allow_peer_listens"), "allow_peer_listens"),
+        allow_peer_backends=_parse_allow_rules(data.get("allow_peer_backends"), "allow_peer_backends"),
+        allow_peer_listens=_parse_allow_rules(data.get("allow_peer_listens"), "allow_peer_listens"),
     )
 
 
@@ -225,6 +296,6 @@ def load_client_config(
         tls_skip_verify=tls_skip_verify,
         proxies=_parse_proxies(data.get("proxies")),
         max_connections=_parse_max_connections(data.get("max_connections")),
-        allow_peer_backends=_parse_cidr_list(data.get("allow_peer_backends"), "allow_peer_backends"),
-        allow_peer_listens=_parse_cidr_list(data.get("allow_peer_listens"), "allow_peer_listens"),
+        allow_peer_backends=_parse_allow_rules(data.get("allow_peer_backends"), "allow_peer_backends"),
+        allow_peer_listens=_parse_allow_rules(data.get("allow_peer_listens"), "allow_peer_listens"),
     )

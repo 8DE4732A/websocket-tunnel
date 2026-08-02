@@ -17,7 +17,7 @@ import secrets
 from typing import Any
 
 from . import __version__
-from .config import ConfigError, ProxyConfig, is_host_allowed, proxy_from_dict, split_host_port
+from .config import ConfigError, ProxyConfig, AllowRule, is_endpoint_allowed, proxy_from_dict, split_host_port
 from .protocol import (
     DATA_CHUNK_SIZE,
     PROTOCOL_VERSION,
@@ -104,8 +104,8 @@ class Session:
         own_name: str,
         own_proxies: tuple[ProxyConfig, ...],
         token: str | None,
-        allow_peer_backends: tuple[str, ...] = (),
-        allow_peer_listens: tuple[str, ...] = (),
+        allow_peer_backends: tuple[AllowRule, ...] = (),
+        allow_peer_listens: tuple[AllowRule, ...] = (),
         ready_event: asyncio.Event,
         logger: logging.Logger,
     ) -> None:
@@ -318,13 +318,13 @@ class Session:
     def _check_peer_proxy_allowed(self, local: ProxyConfig) -> str | None:
         """Return an error reason string if the peer-requested proxy is not allowed, else None."""
         if local.listen_side == "local" and self._allow_peer_listens:
-            listen_host, _ = split_host_port(local.listen)
-            if not is_host_allowed(listen_host, self._allow_peer_listens):
-                return f"listen address {listen_host!r} not in allow_peer_listens"
+            listen_host, listen_port = split_host_port(local.listen)
+            if not is_endpoint_allowed(listen_host, listen_port, self._allow_peer_listens):
+                return f"listen address {local.listen!r} not in allow_peer_listens"
         if local.backend_side == "local" and self._allow_peer_backends:
-            backend_host, _ = split_host_port(local.backend)
-            if not is_host_allowed(backend_host, self._allow_peer_backends):
-                return f"backend address {backend_host!r} not in allow_peer_backends"
+            backend_host, backend_port = split_host_port(local.backend)
+            if not is_endpoint_allowed(backend_host, backend_port, self._allow_peer_backends):
+                return f"backend address {local.backend!r} not in allow_peer_backends"
         return None
 
     async def _handle_proxy_register(self, payload: dict[str, Any]) -> None:

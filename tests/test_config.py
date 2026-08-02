@@ -3,7 +3,8 @@ import pytest
 from websocket_tunnel.config import (
     ConfigError,
     ProxyConfig,
-    is_host_allowed,
+    _parse_allow_rules,
+    is_endpoint_allowed,
     load_client_config,
     load_server_config,
     split_host_port,
@@ -87,25 +88,47 @@ def test_duplicate_proxy_names(tmp_path):
         load_server_config(path)
 
 
-def test_is_host_allowed():
+def test_is_endpoint_allowed():
     # Empty whitelist allows everything.
-    assert is_host_allowed("10.0.0.1", ()) is True
-    assert is_host_allowed("1.2.3.4", ()) is True
+    assert is_endpoint_allowed("10.0.0.1", 80, ()) is True
+    assert is_endpoint_allowed("1.2.3.4", 443, ()) is True
 
-    cidrs = ("127.0.0.1/32", "10.0.0.0/8")
-    assert is_host_allowed("127.0.0.1", cidrs) is True
-    assert is_host_allowed("10.1.2.3", cidrs) is True
-    assert is_host_allowed("192.168.1.1", cidrs) is False
+    # CIDR-only rules (no port restriction) allow any port.
+    rules = _parse_allow_rules(["127.0.0.1/32", "10.0.0.0/8"], "x")
+    assert is_endpoint_allowed("127.0.0.1", 22, rules) is True
+    assert is_endpoint_allowed("10.1.2.3", 8080, rules) is True
+    assert is_endpoint_allowed("192.168.1.1", 80, rules) is False
 
     # Non-IP hostnames are denied when a whitelist is active.
-    assert is_host_allowed("localhost", cidrs) is False
+    assert is_endpoint_allowed("localhost", 80, rules) is False
 
     # IPv6
-    assert is_host_allowed("::1", ("::1/128",)) is True
-    assert is_host_allowed("::2", ("::1/128",)) is False
+    rules6 = _parse_allow_rules(["::1/128"], "x")
+    assert is_endpoint_allowed("::1", 80, rules6) is True
+    assert is_endpoint_allowed("::2", 80, rules6) is False
+
+    # Single-port rule.
+    rules_p = _parse_allow_rules(["127.0.0.1/32:22"], "x")
+    assert is_endpoint_allowed("127.0.0.1", 22, rules_p) is True
+    assert is_endpoint_allowed("127.0.0.1", 23, rules_p) is False
+    assert is_endpoint_allowed("10.0.0.1", 22, rules_p) is False
+
+    # Port-range rule.
+    rules_r = _parse_allow_rules(["10.0.0.0/8:8000-9000"], "x")
+    assert is_endpoint_allowed("10.1.2.3", 8000, rules_r) is True
+    assert is_endpoint_allowed("10.1.2.3", 9000, rules_r) is True
+    assert is_endpoint_allowed("10.1.2.3", 7999, rules_r) is False
+    assert is_endpoint_allowed("10.1.2.3", 9001, rules_r) is False
+    assert is_endpoint_allowed("192.168.1.1", 8080, rules_r) is False
+
+    # Mixed rules: CIDR-only + port-restricted.
+    mixed = _parse_allow_rules(["192.168.0.0/16", "127.0.0.1/32:2222-2222"], "x")
+    assert is_endpoint_allowed("192.168.1.1", 9999, mixed) is True
+    assert is_endpoint_allowed("127.0.0.1", 2222, mixed) is True
+    assert is_endpoint_allowed("127.0.0.1", 22, mixed) is False
 
 
-def test_parse_cidr_list_errors(tmp_path):
+def test_parse_allow_rules_errors(tmp_path):
     path = tmp_path / "bad.toml"
     path.write_text('listen = "0.0.0.0:7000"\nallow_peer_backends = ["not-a-cidr"]\n')
     with pytest.raises(ConfigError, match="invalid CIDR"):
@@ -113,6 +136,16 @@ def test_parse_cidr_list_errors(tmp_path):
 
     path.write_text('listen = "0.0.0.0:7000"\nallow_peer_backends = "10.0.0.0/8"\n')
     with pytest.raises(ConfigError, match="must be a list"):
+        load_server_config(path)
+
+    # Invalid port range (start > end).
+    path.write_text('listen = "0.0.0.0:7000"\nallow_peer_backends = ["127.0.0.1/32:9000-8000"]\n')
+    with pytest.raises(ConfigError, match="invalid port range"):
+        load_server_config(path)
+
+    # Port out of range.
+    path.write_text('listen = "0.0.0.0:7000"\nallow_peer_backends = ["127.0.0.1/32:0"]\n')
+    with pytest.raises(ConfigError, match="invalid port range"):
         load_server_config(path)
 
 

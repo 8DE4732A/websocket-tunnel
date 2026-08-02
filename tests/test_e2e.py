@@ -10,7 +10,7 @@ import threading
 import pytest
 
 from websocket_tunnel.client import TunnelClient
-from websocket_tunnel.config import ClientConfig, ProxyConfig, ServerConfig
+from websocket_tunnel.config import ClientConfig, ProxyConfig, ServerConfig, _parse_allow_rules
 from websocket_tunnel.server import TunnelServer
 
 BACKEND = "127.0.0.1"
@@ -492,7 +492,7 @@ async def test_allow_peer_listens_blocks_denied_proxy():
     server_cfg = ServerConfig(
         listen=f"{BACKEND}:{server_port}",
         token="t",
-        allow_peer_listens=("10.0.0.0/8",),
+        allow_peer_listens=_parse_allow_rules(["10.0.0.0/8"], "allow_peer_listens"),
     )
     # Classic proxy: listen on server (peer from client's view), backend on client (local).
     client_cfg = ClientConfig(
@@ -526,7 +526,7 @@ async def test_allow_peer_backends_blocks_denied_proxy():
     server_cfg = ServerConfig(
         listen=f"{BACKEND}:{server_port}",
         token="t",
-        allow_peer_backends=("127.0.0.1/32",),
+        allow_peer_backends=_parse_allow_rules(["127.0.0.1/32"], "allow_peer_backends"),
     )
     client_cfg = ClientConfig(
         server=f"{BACKEND}:{server_port}",
