@@ -15,6 +15,7 @@ import hmac
 import logging
 import secrets
 from collections.abc import Awaitable, Callable
+from enum import Enum, auto
 from typing import Any
 
 from . import __version__
@@ -69,6 +70,14 @@ class ProxyRejectedError(ConfigError):
     def __init__(self, message: str, *, retryable: bool) -> None:
         super().__init__(message)
         self.retryable = retryable
+
+
+class _RegisterResult(Enum):
+    """Outcome of one proxy-registration attempt."""
+
+    OK = auto()
+    RETRYABLE = auto()
+    PERMANENT = auto()
 
 
 class Stream:
@@ -330,13 +339,10 @@ class Session:
         for proxy in self._own_proxies:
             await self._register_proxy(proxy)
 
-    async def _register_proxy(self, proxy: ProxyConfig, *, retry: bool = True) -> bool:
-        """Register one proxy; on failure schedule a background retry.
-
-        Returns True when the peer acknowledged the proxy.
-        """
+    async def _register_proxy(self, proxy: ProxyConfig, *, retry: bool = True) -> _RegisterResult:
+        """Register one proxy; on a transient failure schedule a background retry."""
         if proxy.name in self._proxies:
-            return True
+            return _RegisterResult.OK
         self._proxies[proxy.name] = proxy
         try:
             if proxy.listen_side == "local":
@@ -345,18 +351,35 @@ class Session:
             future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
             self._pending[proxy.name] = future
             await asyncio.wait_for(future, REGISTER_TIMEOUT)
-            return True
+            return _RegisterResult.OK
         except Exception as exc:
             self._log.error("proxy '%s' registration failed: %s", proxy.name, exc)
             if isinstance(exc, asyncio.TimeoutError):
                 # The peer may have accepted the registration after our ACK
-                # wait expired; ask it to clean up so a retry is not met with
-                # a permanent name conflict.
-                await self._safe_send_control(MessageType.PROXY_UNREGISTER, {"name": proxy.name})
+                # wait expired.  Ask it to clean up and wait for that ACK, so a
+                # late reply cannot be mistaken for the next registration's
+                # confirmation.
+                await self._rollback_registration(proxy.name)
             await self._drop_proxy(proxy.name)
-            if retry and self._is_retryable(exc):
+            if not self._is_retryable(exc):
+                self._log.error("proxy '%s' rejected permanently; giving up", proxy.name)
+                return _RegisterResult.PERMANENT
+            if retry:
                 self._schedule_register_retry(proxy)
-            return False
+            return _RegisterResult.RETRYABLE
+
+    async def _rollback_registration(self, name: str) -> None:
+        """Unregister a proxy whose ACK we timed out on and drain the reply."""
+        self._pending.pop(name, None)
+        await self._safe_send_control(MessageType.PROXY_UNREGISTER, {"name": name})
+        future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self._pending[name] = future
+        try:
+            await asyncio.wait_for(future, REGISTER_TIMEOUT)
+        except Exception:
+            pass
+        finally:
+            self._pending.pop(name, None)
 
     @staticmethod
     def _is_retryable(exc: BaseException) -> bool:
@@ -388,8 +411,11 @@ class Session:
                 await asyncio.sleep(delay)
                 if self._closed or proxy.name in self._proxies:
                     return
-                if await self._register_proxy(proxy, retry=False):
+                result = await self._register_proxy(proxy, retry=False)
+                if result is _RegisterResult.OK:
                     self._log.info("proxy '%s' registered after retry", proxy.name)
+                    return
+                if result is _RegisterResult.PERMANENT:
                     return
                 delay = min(delay * 2, REGISTER_RETRY_MAX)
         except asyncio.CancelledError:

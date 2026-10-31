@@ -8,10 +8,12 @@ import socket
 import threading
 
 import pytest
+import websockets
 
 from websocket_tunnel.client import TunnelClient
 from websocket_tunnel.config import ClientConfig, ProxyConfig, ServerConfig, _parse_allow_rules
 from websocket_tunnel.server import TunnelServer
+from websocket_tunnel.session import Session, _RegisterResult
 
 BACKEND = "127.0.0.1"
 
@@ -670,8 +672,9 @@ async def test_server_evicts_stale_session_on_reconnect():
     assert old.closed is True
     assert new.closed is False
     assert server._instances["inst-1"] is new
-    # The evicted session must hand its max_connections slot to the replacement.
+    # The evicted session's max_connections slot is handed to the replacement.
     assert old not in server._admitted
+    assert new in server._admitted
 
     # A different client must never evict an existing session.
     other = FakeSession("inst-2")
@@ -703,6 +706,61 @@ async def test_concurrent_reconnect_claims_leave_one_owner():
     assert owner.closed is False
     loser = second if owner is first else first
     assert loser.closed is True
+
+
+@pytest.mark.asyncio
+async def test_claim_for_one_instance_does_not_block_another():
+    """A slow stale-session teardown must not delay unrelated clients."""
+    server = TunnelServer(ServerConfig(listen=f"{BACKEND}:{free_port()}"))
+    loop = asyncio.get_running_loop()
+
+    class SlowSession:
+        def __init__(self, instance: str) -> None:
+            self.peer_instance = instance
+            self.closed = False
+
+        async def close(self) -> None:
+            await asyncio.sleep(1.0)
+            self.closed = True
+
+    old_a = SlowSession("a")
+    await server._claim_instance("a", old_a)  # type: ignore[arg-type]
+    pending_a = asyncio.create_task(server._claim_instance("a", SlowSession("a")))  # type: ignore[arg-type]
+    await asyncio.sleep(0.05)
+
+    start = loop.time()
+    await server._claim_instance("b", SlowSession("b"))  # type: ignore[arg-type]
+    elapsed = loop.time() - start
+    assert elapsed < 0.5, f"claim for 'b' was blocked for {elapsed:.2f}s"
+    await pending_a
+
+
+@pytest.mark.asyncio
+async def test_unauthenticated_connection_flood_is_bounded():
+    """Connections that never handshake must not grow without bound."""
+    server_port = free_port()
+    server_cfg = ServerConfig(listen=f"{BACKEND}:{server_port}", token="t", max_connections=1)
+    server = TunnelServer(server_cfg)
+    server_task = asyncio.create_task(server.run())
+    conns = []
+    try:
+        uri = f"ws://{BACKEND}:{server_port}/"
+        for _ in range(12):
+            try:
+                conns.append(await asyncio.wait_for(websockets.connect(uri), 2))
+            except Exception:
+                pass
+        await asyncio.sleep(0.3)
+        limit = server_cfg.max_connections + TunnelServer._HANDSHAKE_HEADROOM
+        assert server._active_handlers <= limit
+    finally:
+        for conn in conns:
+            try:
+                await conn.close()
+            except Exception:
+                pass
+        await server.stop()
+        await asyncio.gather(server_task, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -772,3 +830,26 @@ async def test_proxy_registration_retries_until_bind_succeeds():
         await cleanup(server, client, server_task, client_task)
         backend.close()
         await backend.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_retry_loop_stops_on_permanent_failure(monkeypatch):
+    """A permanent rejection must end the retry loop immediately."""
+    import logging
+
+    monkeypatch.setattr("websocket_tunnel.session.REGISTER_RETRY_BASE", 0.01)
+    session = object.__new__(Session)
+    session._closed = False
+    session._proxies = {}
+    session._log = logging.getLogger("test")
+    calls = 0
+
+    async def fake_register(proxy, *, retry=True):
+        nonlocal calls
+        calls += 1
+        return _RegisterResult.PERMANENT
+
+    session._register_proxy = fake_register  # type: ignore[method-assign]
+    proxy = ProxyConfig("p", "127.0.0.1:1", "local", "127.0.0.1:2", "peer")
+    await session._register_retry_loop(proxy)
+    assert calls == 1
