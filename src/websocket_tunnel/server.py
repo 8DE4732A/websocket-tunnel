@@ -12,7 +12,7 @@ from websockets.asyncio.server import ServerConnection
 from . import __version__
 from .config import ConfigError, ServerConfig, split_host_port
 from .protocol import MAX_CONTROL_SIZE
-from .session import Session
+from .session import STALE_CLOSE_TIMEOUT, Session
 
 
 class TunnelServer:
@@ -24,11 +24,15 @@ class TunnelServer:
         # client reuses its instance id, letting us evict a stale half-open
         # session immediately instead of waiting for the ping timeout.
         self._instances: dict[str, Session] = {}
+        # Sessions that hold a max_connections slot.  Tracked as a set rather
+        # than a Semaphore so that evicting a stale session can hand its slot
+        # to the replacement deterministically.
+        self._admitted: set[Session] = set()
+        # Serialises claims: overlapping reconnects from one client must not
+        # race each other into the instance map.
+        self._claim_lock = asyncio.Lock()
         self._stop_event = asyncio.Event()
         self.ready_event = asyncio.Event()
-        self._conn_sem: asyncio.Semaphore | None = (
-            asyncio.Semaphore(config.max_connections) if config.max_connections > 0 else None
-        )
 
     async def run(self) -> None:
         ssl_context = self._build_ssl()
@@ -62,12 +66,20 @@ class TunnelServer:
         return context
 
     async def _handle_connection(self, ws: ServerConnection) -> None:
-        if self._conn_sem is not None:
-            if self._conn_sem.locked():
-                self._log.warning("max_connections reached; rejecting new connection")
-                await ws.close()
+        async def admit(session: Session) -> None:
+            """Enforce max_connections once the peer identity is known.
+
+            Doing this after the handshake lets a reconnect evict its own
+            stale session first, so it is not rejected by the slot that
+            session still holds.
+            """
+            limit = self._config.max_connections
+            if limit <= 0:
                 return
-            await self._conn_sem.acquire()
+            if len(self._admitted) >= limit:
+                raise ConnectionError(f"max_connections ({limit}) reached")
+            self._admitted.add(session)
+
         session = Session(
             ws,
             role="server",
@@ -77,6 +89,7 @@ class TunnelServer:
             allow_peer_backends=self._config.allow_peer_backends,
             allow_peer_listens=self._config.allow_peer_listens,
             on_peer_instance=self._claim_instance,
+            on_authenticated=admit,
             ready_event=self.ready_event,
             logger=self._log,
         )
@@ -85,10 +98,9 @@ class TunnelServer:
             await session.run()
         finally:
             self._sessions.discard(session)
+            self._admitted.discard(session)
             if self._instances.get(session.peer_instance) is session:
                 del self._instances[session.peer_instance]
-            if self._conn_sem is not None:
-                self._conn_sem.release()
 
     async def _claim_instance(self, instance: str, session: Session) -> None:
         """Evict a stale session when the same client reconnects.
@@ -99,11 +111,22 @@ class TunnelServer:
         same listener ports.  Matching on the process-level instance id keeps
         this safe: genuinely different clients never evict each other.
         """
-        old = self._instances.get(instance)
-        if old is not None and old is not session:
-            self._log.info("peer %s reconnected; closing stale session", instance[:8])
-            await old.close()
-        self._instances[instance] = session
+        async with self._claim_lock:
+            old = self._instances.get(instance)
+            if old is not None and old is not session:
+                self._log.info("peer %s reconnected; closing stale session", instance[:8])
+                # Hand the slot over before close() finishes so that admit()
+                # below sees the free capacity.
+                self._admitted.discard(old)
+                try:
+                    await asyncio.wait_for(old.close(), timeout=STALE_CLOSE_TIMEOUT)
+                except asyncio.TimeoutError:
+                    # Cleanup continues in the background (close() shields its
+                    # work); the replacement retries binding if needed.
+                    self._log.warning(
+                        "stale session did not close within %.1fs; continuing", STALE_CLOSE_TIMEOUT
+                    )
+            self._instances[instance] = session
 
     async def _close_sessions(self) -> None:
         sessions = list(self._sessions)

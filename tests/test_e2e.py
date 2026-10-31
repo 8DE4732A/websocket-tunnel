@@ -664,16 +664,75 @@ async def test_server_evicts_stale_session_on_reconnect():
 
     old = FakeSession("inst-1")
     new = FakeSession("inst-1")
+    server._admitted.add(old)  # type: ignore[arg-type]
     await server._claim_instance("inst-1", old)  # type: ignore[arg-type]
     await server._claim_instance("inst-1", new)  # type: ignore[arg-type]
     assert old.closed is True
     assert new.closed is False
     assert server._instances["inst-1"] is new
+    # The evicted session must hand its max_connections slot to the replacement.
+    assert old not in server._admitted
 
     # A different client must never evict an existing session.
     other = FakeSession("inst-2")
     await server._claim_instance("inst-2", other)  # type: ignore[arg-type]
     assert new.closed is False
+
+
+@pytest.mark.asyncio
+async def test_concurrent_reconnect_claims_leave_one_owner():
+    """Overlapping reconnects from one client must not leave two live sessions."""
+    server = TunnelServer(ServerConfig(listen=f"{BACKEND}:{free_port()}"))
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.peer_instance = "inst"
+            self.closed = False
+
+        async def close(self) -> None:
+            self.closed = True
+
+    first = FakeSession()
+    second = FakeSession()
+    await asyncio.gather(
+        server._claim_instance("inst", first),  # type: ignore[arg-type]
+        server._claim_instance("inst", second),  # type: ignore[arg-type]
+    )
+    owner = server._instances["inst"]
+    assert owner in (first, second)
+    assert owner.closed is False
+    loser = second if owner is first else first
+    assert loser.closed is True
+
+
+@pytest.mark.asyncio
+async def test_permanent_rejection_is_not_retried():
+    """A policy rejection must not enter the retry loop."""
+    server_port = free_port()
+    listen_port = free_port()
+    backend, backend_port = await start_echo()
+    # Server refuses to dial 127.0.0.1, so the peer-registered reverse proxy
+    # (backend on the server) is rejected permanently.
+    server_cfg = ServerConfig(
+        listen=f"{BACKEND}:{server_port}",
+        token="t",
+        allow_peer_backends=_parse_allow_rules(["10.0.0.0/8"], "allow_peer_backends"),
+    )
+    client_cfg = ClientConfig(
+        server=f"{BACKEND}:{server_port}",
+        token="t",
+        proxies=(ProxyConfig("echo", f"{BACKEND}:{listen_port}", "local", f"{BACKEND}:{backend_port}", "peer"),),
+    )
+    server, client, server_task, client_task = await start_pair(server_cfg, client_cfg)
+    try:
+        await asyncio.sleep(0.5)
+        session = client._session
+        assert session is not None
+        assert session._register_retries == {}
+    finally:
+        await cleanup(server, client, server_task, client_task)
+        backend.close()
+        await backend.wait_closed()
 
 
 @pytest.mark.asyncio

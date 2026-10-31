@@ -53,6 +53,22 @@ _FLOW_QUEUE_SIZE = 4096
 _PRIO_CTRL = 0
 _PRIO_DATA = 1
 _SEND_QUEUE_SIZE = 4096 + 256
+# Upper bound on how long a reconnecting session waits for its stale
+# predecessor to finish releasing listeners before continuing.
+STALE_CLOSE_TIMEOUT = 5.0
+
+
+class ProxyRejectedError(ConfigError):
+    """The peer rejected a proxy registration.
+
+    ``retryable`` distinguishes transient failures (a listener still bound by a
+    stale session) from permanent ones (policy denial, name conflict), so the
+    retry loop does not hammer the peer forever on a configuration error.
+    """
+
+    def __init__(self, message: str, *, retryable: bool) -> None:
+        super().__init__(message)
+        self.retryable = retryable
 
 
 class Stream:
@@ -114,6 +130,7 @@ class Session:
         allow_peer_listens: tuple[AllowRule, ...] = (),
         instance: str | None = None,
         on_peer_instance: Callable[[str, Session], Awaitable[None]] | None = None,
+        on_authenticated: Callable[[Session], Awaitable[None]] | None = None,
         ready_event: asyncio.Event,
         logger: logging.Logger,
     ) -> None:
@@ -130,8 +147,15 @@ class Session:
         # Async callback (peer_instance: str) -> None, invoked after the
         # server learns the peer's instance id during the handshake.
         self._on_peer_instance = on_peer_instance
+        # Async callback (session) -> None run after a successful handshake,
+        # before any proxy is registered.  The server uses it to enforce
+        # max_connections *after* stale-session eviction, so a reconnecting
+        # client is not turned away by the slot its own dead session holds.
+        self._on_authenticated = on_authenticated
         self._peer_instance = ""
         self._register_retries: dict[str, asyncio.Task[None]] = {}
+        # Set on first close() call; every caller awaits the same cleanup.
+        self._close_task: asyncio.Task[None] | None = None
         self._ready = ready_event
         self._log = logger
         # Single priority queue: entries are (priority, seq, frame).
@@ -324,10 +348,24 @@ class Session:
             return True
         except Exception as exc:
             self._log.error("proxy '%s' registration failed: %s", proxy.name, exc)
+            if isinstance(exc, asyncio.TimeoutError):
+                # The peer may have accepted the registration after our ACK
+                # wait expired; ask it to clean up so a retry is not met with
+                # a permanent name conflict.
+                await self._safe_send_control(MessageType.PROXY_UNREGISTER, {"name": proxy.name})
             await self._drop_proxy(proxy.name)
-            if retry:
+            if retry and self._is_retryable(exc):
                 self._schedule_register_retry(proxy)
             return False
+
+    @staticmethod
+    def _is_retryable(exc: BaseException) -> bool:
+        """Only transient failures are worth retrying."""
+        if isinstance(exc, ProxyRejectedError):
+            return exc.retryable
+        if isinstance(exc, ConfigError):
+            return False
+        return True
 
     def _schedule_register_retry(self, proxy: ProxyConfig) -> None:
         if self._closed:
@@ -364,6 +402,11 @@ class Session:
             self._spawn(self._handle_listener_conn(name, reader, writer))
 
         server = await asyncio.start_server(_accept, host, port, reuse_address=True)
+        if self._closed:
+            # Raced with close(): don't leak a listener nobody will clean up.
+            server.close()
+            await server.wait_closed()
+            raise ConnectionError("session closed")
         self._listeners[name] = server
         self._log.info("listener bound: %s -> %s", name, addr)
 
@@ -394,12 +437,16 @@ class Session:
         try:
             proxy = proxy_from_dict(payload)
         except ConfigError as exc:
-            await self._safe_send_control(MessageType.PROXY_ERROR, {"name": payload.get("name"), "reason": str(exc)})
+            await self._safe_send_control(
+                MessageType.PROXY_ERROR,
+                {"name": payload.get("name"), "reason": str(exc), "retryable": False},
+            )
             return
         name = proxy.name
         if name in self._proxies:
             await self._safe_send_control(
-                MessageType.PROXY_ERROR, {"name": name, "reason": f"proxy name conflict: {name}"}
+                MessageType.PROXY_ERROR,
+                {"name": name, "reason": f"proxy name conflict: {name}", "retryable": False},
             )
             return
         local = ProxyConfig(
@@ -412,7 +459,9 @@ class Session:
         denied = self._check_peer_proxy_allowed(local)
         if denied:
             self._log.warning("peer proxy '%s' rejected: %s", name, denied)
-            await self._safe_send_control(MessageType.PROXY_ERROR, {"name": name, "reason": denied})
+            await self._safe_send_control(
+                MessageType.PROXY_ERROR, {"name": name, "reason": denied, "retryable": False}
+            )
             return
         self._proxies[name] = local
         try:
@@ -425,7 +474,11 @@ class Session:
             await self._safe_send_control(MessageType.PROXY_OK, {"name": name})
         except Exception as exc:
             self._proxies.pop(name, None)
-            await self._safe_send_control(MessageType.PROXY_ERROR, {"name": name, "reason": str(exc)})
+            # Binding failures (port still held, transient socket error) are
+            # worth retrying; the peer's backoff caps the rate.
+            await self._safe_send_control(
+                MessageType.PROXY_ERROR, {"name": name, "reason": str(exc), "retryable": True}
+            )
 
     async def _handle_proxy_unregister(self, payload: dict[str, Any]) -> None:
         name = payload.get("name")
@@ -443,7 +496,13 @@ class Session:
         if message_type is MessageType.PROXY_OK:
             future.set_result(None)
         else:
-            future.set_exception(ConfigError(f"proxy '{name}' rejected by peer: {payload.get('reason', '')}"))
+            reason = payload.get("reason", "")
+            future.set_exception(
+                ProxyRejectedError(
+                    f"proxy '{name}' rejected by peer: {reason}",
+                    retryable=bool(payload.get("retryable", True)),
+                )
+            )
 
     # -------------------------------------------------------------- streams
 
@@ -767,11 +826,19 @@ class Session:
             self._log.error("handshake failed: %s", exc)
             await self.close()
             return
+        if self._on_authenticated is not None:
+            try:
+                await self._on_authenticated(self)
+            except Exception as exc:
+                self._log.warning("connection rejected after handshake: %s", exc)
+                await self.close()
+                return
         self._sender_task = self._spawn(self._ws_sender_loop())
         self._spawn(self._ping_loop())
         self._read_task = self._spawn(self._read_loop())
         try:
-            await self._register_own_proxies()
+            if not self._closed:
+                await self._register_own_proxies()
             if not self._read_task.done() and not self._closed:
                 self._ready.set()
                 self._log.info("session ready with %d proxy(ies)", len(self._proxies))
@@ -782,8 +849,20 @@ class Session:
             await self.close()
 
     async def close(self) -> None:
-        if self._closed:
-            return
+        """Close the session and wait until cleanup has actually finished.
+
+        Every caller awaits the same cleanup task.  Returning early (as a
+        plain ``if self._closed: return`` would) is wrong here: a replacing
+        session relies on this call to guarantee that listeners are released
+        before it binds the same addresses.
+        """
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(self._close_impl())
+        # shield: a caller giving up (e.g. via wait_for) must not abort cleanup
+        # half-way and leak listeners.
+        await asyncio.shield(self._close_task)
+
+    async def _close_impl(self) -> None:
         self._closed = True
         self._register_retries.clear()
         for stream_id in list(self._streams):
@@ -792,14 +871,16 @@ class Session:
             if not future.done():
                 future.set_exception(ConnectionError("session closed"))
         self._pending.clear()
-        for task in list(self._tasks):
-            if task is self._read_task:
-                continue
+        # Cancel everything except ourselves.  When close() is called from
+        # run() this includes the read task, which may otherwise keep binding
+        # listeners after _closed is set.
+        current = asyncio.current_task()
+        victims = [task for task in self._tasks if task is not current]
+        for task in victims:
             task.cancel()
-        if self._tasks:
-            await asyncio.gather(*(t for t in self._tasks if t is not self._read_task), return_exceptions=True)
-        if self._read_task is not None:
-            self._tasks.discard(self._read_task)
+        if victims:
+            await asyncio.gather(*victims, return_exceptions=True)
+        self._tasks.difference_update(victims)
         for server in list(self._listeners.values()):
             server.close()
         for server in list(self._listeners.values()):
