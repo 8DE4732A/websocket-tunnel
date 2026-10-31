@@ -14,6 +14,7 @@ import hashlib
 import hmac
 import logging
 import secrets
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from . import __version__
@@ -30,6 +31,11 @@ from .protocol import (
 
 HANDSHAKE_TIMEOUT = 15.0
 REGISTER_TIMEOUT = 10.0
+# Backoff used when a proxy registration is rejected (e.g. the peer still
+# holds a stale listener from a half-open connection).  Retrying forever
+# until the session ends lets the proxy recover without a manual restart.
+REGISTER_RETRY_BASE = 1.0
+REGISTER_RETRY_MAX = 30.0
 OPEN_TIMEOUT = 10.0
 STREAM_OPEN_TIMEOUT = 15.0
 PING_INTERVAL = 30.0
@@ -106,6 +112,8 @@ class Session:
         token: str | None,
         allow_peer_backends: tuple[AllowRule, ...] = (),
         allow_peer_listens: tuple[AllowRule, ...] = (),
+        instance: str | None = None,
+        on_peer_instance: Callable[[str, Session], Awaitable[None]] | None = None,
         ready_event: asyncio.Event,
         logger: logging.Logger,
     ) -> None:
@@ -116,6 +124,14 @@ class Session:
         self._token = token
         self._allow_peer_backends = allow_peer_backends
         self._allow_peer_listens = allow_peer_listens
+        # Stable id for this process, sent in HELLO so the server can tell a
+        # reconnect from a brand-new client and evict the stale session.
+        self._instance = instance
+        # Async callback (peer_instance: str) -> None, invoked after the
+        # server learns the peer's instance id during the handshake.
+        self._on_peer_instance = on_peer_instance
+        self._peer_instance = ""
+        self._register_retries: dict[str, asyncio.Task[None]] = {}
         self._ready = ready_event
         self._log = logger
         # Single priority queue: entries are (priority, seq, frame).
@@ -137,6 +153,11 @@ class Session:
         self._peer_name = ""
 
     # ------------------------------------------------------------------ utils
+
+    @property
+    def peer_instance(self) -> str:
+        """Instance id reported by the peer during the handshake ("" if none)."""
+        return self._peer_instance
 
     def _spawn(self, coro: Any) -> asyncio.Task[None]:
         task = asyncio.create_task(coro)
@@ -245,6 +266,11 @@ class Session:
                     await self._direct_send(MessageType.HELLO_ERROR, {"reason": "authentication failed"})
                     raise ConfigError("authentication failed")
             self._peer_name = str(payload.get("name", ""))
+            self._peer_instance = str(payload.get("instance", ""))
+            if self._on_peer_instance is not None and self._peer_instance:
+                # Room for the server to evict a stale session from the same
+                # client before we start binding listeners.
+                await self._on_peer_instance(self._peer_instance, self)
             await self._direct_send(MessageType.HELLO_OK, {"node": "server", "version": __version__})
         else:
             frame = await asyncio.wait_for(self._ws.recv(), HANDSHAKE_TIMEOUT)
@@ -263,6 +289,7 @@ class Session:
                     "name": self._own_name,
                     "response": response,
                     "version": __version__,
+                    "instance": self._instance or "",
                 },
             )
             frame = await asyncio.wait_for(self._ws.recv(), HANDSHAKE_TIMEOUT)
@@ -279,9 +306,13 @@ class Session:
         for proxy in self._own_proxies:
             await self._register_proxy(proxy)
 
-    async def _register_proxy(self, proxy: ProxyConfig) -> None:
+    async def _register_proxy(self, proxy: ProxyConfig, *, retry: bool = True) -> bool:
+        """Register one proxy; on failure schedule a background retry.
+
+        Returns True when the peer acknowledged the proxy.
+        """
         if proxy.name in self._proxies:
-            return
+            return True
         self._proxies[proxy.name] = proxy
         try:
             if proxy.listen_side == "local":
@@ -290,9 +321,41 @@ class Session:
             future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
             self._pending[proxy.name] = future
             await asyncio.wait_for(future, REGISTER_TIMEOUT)
+            return True
         except Exception as exc:
             self._log.error("proxy '%s' registration failed: %s", proxy.name, exc)
             await self._drop_proxy(proxy.name)
+            if retry:
+                self._schedule_register_retry(proxy)
+            return False
+
+    def _schedule_register_retry(self, proxy: ProxyConfig) -> None:
+        if self._closed:
+            return
+        existing = self._register_retries.get(proxy.name)
+        if existing is not None and not existing.done():
+            return
+        self._register_retries[proxy.name] = self._spawn(self._register_retry_loop(proxy))
+
+    async def _register_retry_loop(self, proxy: ProxyConfig) -> None:
+        """Retry a failed registration with exponential backoff until it sticks.
+
+        A registration can fail because the peer still holds a listener from a
+        previous (half-open) connection; that clears up on its own, so retrying
+        is enough to recover without restarting the client.
+        """
+        delay = REGISTER_RETRY_BASE
+        try:
+            while not self._closed:
+                await asyncio.sleep(delay)
+                if self._closed or proxy.name in self._proxies:
+                    return
+                if await self._register_proxy(proxy, retry=False):
+                    self._log.info("proxy '%s' registered after retry", proxy.name)
+                    return
+                delay = min(delay * 2, REGISTER_RETRY_MAX)
+        except asyncio.CancelledError:
+            raise
 
     async def _bind_listener(self, name: str, addr: str) -> None:
         host, port = split_host_port(addr)
@@ -722,6 +785,7 @@ class Session:
         if self._closed:
             return
         self._closed = True
+        self._register_retries.clear()
         for stream_id in list(self._streams):
             self._remove_stream(stream_id)
         for future in list(self._pending.values()):

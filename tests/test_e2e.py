@@ -647,3 +647,69 @@ async def test_challenge_response_no_token_server():
         await cleanup(server, client, server_task, client_task)
         backend.close()
         await backend.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_server_evicts_stale_session_on_reconnect():
+    """A reconnecting client's new session evicts the stale one holding its ports."""
+    server = TunnelServer(ServerConfig(listen=f"{BACKEND}:{free_port()}"))
+
+    class FakeSession:
+        def __init__(self, instance: str) -> None:
+            self.peer_instance = instance
+            self.closed = False
+
+        async def close(self) -> None:
+            self.closed = True
+
+    old = FakeSession("inst-1")
+    new = FakeSession("inst-1")
+    await server._claim_instance("inst-1", old)  # type: ignore[arg-type]
+    await server._claim_instance("inst-1", new)  # type: ignore[arg-type]
+    assert old.closed is True
+    assert new.closed is False
+    assert server._instances["inst-1"] is new
+
+    # A different client must never evict an existing session.
+    other = FakeSession("inst-2")
+    await server._claim_instance("inst-2", other)  # type: ignore[arg-type]
+    assert new.closed is False
+
+
+@pytest.mark.asyncio
+async def test_proxy_registration_retries_until_bind_succeeds():
+    """A proxy whose local listener is temporarily unavailable recovers by retrying."""
+    backend, backend_port = await start_echo()
+    server_port = free_port()
+    listen_port = free_port()
+
+    # Hold the port so the client's first bind attempt fails.
+    blocker = socket.socket()
+    blocker.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    blocker.bind((BACKEND, listen_port))
+    blocker.listen(1)
+
+    server_cfg = ServerConfig(listen=f"{BACKEND}:{server_port}", token="t")
+    client_cfg = ClientConfig(
+        server=f"{BACKEND}:{server_port}",
+        token="t",
+        proxies=(ProxyConfig("echo", f"{BACKEND}:{listen_port}", "local", f"{BACKEND}:{backend_port}", "peer"),),
+    )
+    server, client, server_task, client_task = await start_pair(server_cfg, client_cfg)
+    try:
+        blocker.close()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 20.0
+        while True:
+            try:
+                assert await echo_once(listen_port, b"retry-ok") == b"retry-ok"
+                break
+            except (OSError, ConnectionError):
+                if loop.time() > deadline:
+                    raise AssertionError("proxy did not recover after retry")
+                await asyncio.sleep(0.5)
+    finally:
+        blocker.close()
+        await cleanup(server, client, server_task, client_task)
+        backend.close()
+        await backend.wait_closed()

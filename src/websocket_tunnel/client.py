@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import ssl
+import uuid
 
 import websockets
 from websockets.asyncio.client import connect
@@ -34,6 +35,9 @@ class TunnelClient:
         self._stopping = False
         self._stop_wait = asyncio.Event()
         self.ready_event = asyncio.Event()
+        # Stable per-process id: lets the server recognise a reconnect from
+        # this client and immediately drop the stale session holding ports.
+        self._instance = uuid.uuid4().hex
 
     async def run(self) -> None:
         backoff = RECONNECT_BASE
@@ -59,6 +63,7 @@ class TunnelClient:
                 token=self._config.token,
                 allow_peer_backends=self._config.allow_peer_backends,
                 allow_peer_listens=self._config.allow_peer_listens,
+                instance=self._instance,
                 ready_event=self.ready_event,
                 logger=self._log,
             )
